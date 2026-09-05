@@ -137,11 +137,14 @@ class Transcriber:
             logger.debug("Audio too quiet (rms=%.4f), skipping", rms)
             return ""
 
+        # faster-whisper expects ISO 639-1 codes ("es", "en"); strip region suffix
+        whisper_lang = self.language.split("-")[0].lower() if self.language else None
+
         # faster-whisper returns segments generator
         assert self.whisper_model is not None
         segments, info = self.whisper_model.transcribe(
             audio_np,
-            language="en",
+            language=whisper_lang,
             beam_size=1,  # Faster with beam_size=1
             vad_filter=True,  # Filter out silence
             no_speech_threshold=0.6,  # Skip segments likely without speech

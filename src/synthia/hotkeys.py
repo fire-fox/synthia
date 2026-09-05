@@ -36,7 +36,12 @@ class HotkeyListener(ABC):
         pass
 
     @abstractmethod
-    def update_keys(self, dictation_key_string: str, assistant_key_string: str) -> None:
+    def update_keys(
+        self,
+        dictation_key_string: str,
+        assistant_key_string: str,
+        cloud_key_string: Optional[str] = None,
+    ) -> None:
         """Update hotkeys without restarting the listener."""
         pass
 
@@ -67,6 +72,9 @@ class EvdevHotkeyListener(HotkeyListener):
         on_assistant_release: Callable[[], None],
         dictation_key_code: int = 97,  # Default: Right Ctrl
         assistant_key_code: int = 100,  # Default: Right Alt
+        on_cloud_press: Optional[Callable[[], None]] = None,
+        on_cloud_release: Optional[Callable[[], None]] = None,
+        cloud_key_code: Optional[int] = None,
     ) -> None:
         self.on_dictation_press = on_dictation_press
         self.on_dictation_release = on_dictation_release
@@ -74,6 +82,9 @@ class EvdevHotkeyListener(HotkeyListener):
         self.on_assistant_release = on_assistant_release
         self.dictation_key_code = dictation_key_code
         self.assistant_key_code = assistant_key_code
+        self.on_cloud_press = on_cloud_press
+        self.on_cloud_release = on_cloud_release
+        self.cloud_key_code = cloud_key_code
 
         self.running = False
         self.thread: Optional[threading.Thread] = None
@@ -98,7 +109,12 @@ class EvdevHotkeyListener(HotkeyListener):
                     # Check if device has key events and has our target keys
                     if ecodes.EV_KEY in capabilities:
                         keys = capabilities[ecodes.EV_KEY]
-                        if self.dictation_key_code in keys or self.assistant_key_code in keys:
+                        relevant = (
+                            self.dictation_key_code in keys
+                            or self.assistant_key_code in keys
+                            or (self.cloud_key_code is not None and self.cloud_key_code in keys)
+                        )
+                        if relevant:
                             keyboards.append(device)
                             logger.info("Found keyboard: %s (%s)", device.name, device.path)
                 except (PermissionError, OSError) as e:
@@ -137,6 +153,14 @@ class EvdevHotkeyListener(HotkeyListener):
                                         self.on_assistant_press()
                                     elif event.value == 0:  # Release
                                         self.on_assistant_release()
+                                elif (
+                                    self.cloud_key_code is not None
+                                    and event.code == self.cloud_key_code
+                                ):
+                                    if event.value == 1 and self.on_cloud_press is not None:
+                                        self.on_cloud_press()
+                                    elif event.value == 0 and self.on_cloud_release is not None:
+                                        self.on_cloud_release()
                     except BlockingIOError:
                         pass
 
@@ -172,16 +196,25 @@ class EvdevHotkeyListener(HotkeyListener):
         if self.thread:
             self.thread.join()
 
-    def update_keys(self, dictation_key_string: str, assistant_key_string: str) -> None:
+    def update_keys(
+        self,
+        dictation_key_string: str,
+        assistant_key_string: str,
+        cloud_key_string: Optional[str] = None,
+    ) -> None:
         """Update hotkeys without restarting the listener."""
         self.dictation_key_code = self.get_key_code(dictation_key_string)
         self.assistant_key_code = self.get_key_code(assistant_key_string)
+        if cloud_key_string is not None:
+            self.cloud_key_code = self.get_key_code(cloud_key_string)
         logger.info(
-            "Hotkeys updated: dictation=%s (code %s), assistant=%s (code %s)",
+            "Hotkeys updated: dictation=%s (code %s), assistant=%s (code %s), cloud=%s (code %s)",
             dictation_key_string,
             self.dictation_key_code,
             assistant_key_string,
             self.assistant_key_code,
+            cloud_key_string,
+            self.cloud_key_code,
         )
 
 
@@ -196,6 +229,9 @@ class PynputHotkeyListener(HotkeyListener):
         on_assistant_release: Callable[[], None],
         dictation_key: Any,
         assistant_key: Any,
+        on_cloud_press: Optional[Callable[[], None]] = None,
+        on_cloud_release: Optional[Callable[[], None]] = None,
+        cloud_key: Any = None,
     ) -> None:
         self.on_dictation_press = on_dictation_press
         self.on_dictation_release = on_dictation_release
@@ -203,28 +239,33 @@ class PynputHotkeyListener(HotkeyListener):
         self.on_assistant_release = on_assistant_release
         self.dictation_key = dictation_key
         self.assistant_key = assistant_key
+        self.on_cloud_press = on_cloud_press
+        self.on_cloud_release = on_cloud_release
+        self.cloud_key = cloud_key
 
         self.listener: Any = None
         self.dictation_active: bool = False
         self.assistant_active: bool = False
+        self.cloud_active: bool = False
 
     def _on_press(self, key: Any) -> None:
         """Handle key press."""
         try:
-            if (
-                key == self.dictation_key
-                and not self.dictation_active
-                and not self.assistant_active
-            ):
+            any_active = self.dictation_active or self.assistant_active or self.cloud_active
+            if key == self.dictation_key and not any_active:
                 self.dictation_active = True
                 self.on_dictation_press()
-            elif (
-                key == self.assistant_key
-                and not self.assistant_active
-                and not self.dictation_active
-            ):
+            elif key == self.assistant_key and not any_active:
                 self.assistant_active = True
                 self.on_assistant_press()
+            elif (
+                self.cloud_key is not None
+                and key == self.cloud_key
+                and not any_active
+                and self.on_cloud_press is not None
+            ):
+                self.cloud_active = True
+                self.on_cloud_press()
         except AttributeError:
             pass
 
@@ -237,6 +278,14 @@ class PynputHotkeyListener(HotkeyListener):
             elif key == self.assistant_key and self.assistant_active:
                 self.assistant_active = False
                 self.on_assistant_release()
+            elif (
+                self.cloud_key is not None
+                and key == self.cloud_key
+                and self.cloud_active
+                and self.on_cloud_release is not None
+            ):
+                self.cloud_active = False
+                self.on_cloud_release()
         except AttributeError:
             pass
 
@@ -257,7 +306,12 @@ class PynputHotkeyListener(HotkeyListener):
         if self.listener:
             self.listener.join()
 
-    def update_keys(self, dictation_key_string: str, assistant_key_string: str) -> None:
+    def update_keys(
+        self,
+        dictation_key_string: str,
+        assistant_key_string: str,
+        cloud_key_string: Optional[str] = None,
+    ) -> None:
         """Update hotkeys without restarting the listener."""
         from pynput.keyboard import Key
 
@@ -270,10 +324,13 @@ class PynputHotkeyListener(HotkeyListener):
 
         self.dictation_key = parse_key(dictation_key_string)
         self.assistant_key = parse_key(assistant_key_string)
+        if cloud_key_string is not None:
+            self.cloud_key = parse_key(cloud_key_string)
         logger.info(
-            "Hotkeys updated: dictation=%s, assistant=%s",
+            "Hotkeys updated: dictation=%s, assistant=%s, cloud=%s",
             dictation_key_string,
             assistant_key_string,
+            cloud_key_string,
         )
 
 
@@ -286,6 +343,10 @@ def create_hotkey_listener(
     assistant_key: Any = None,
     dictation_key_string: str = "Key.ctrl_r",
     assistant_key_string: str = "Key.alt_r",
+    on_cloud_press: Optional[Callable[[], None]] = None,
+    on_cloud_release: Optional[Callable[[], None]] = None,
+    cloud_key: Any = None,
+    cloud_key_string: Optional[str] = None,
 ) -> HotkeyListener:
     """Create the appropriate hotkey listener for the current display server.
 
@@ -302,12 +363,18 @@ def create_hotkey_listener(
     Returns:
         HotkeyListener instance appropriate for the display server
     """
+    cloud_code: Optional[int] = None
+    if cloud_key_string is not None:
+        cloud_code = EvdevHotkeyListener.get_key_code(cloud_key_string)
+
     if is_wayland():
         logger.info("Wayland detected - using evdev for hotkeys")
         dictation_code = EvdevHotkeyListener.get_key_code(dictation_key_string)
         assistant_code = EvdevHotkeyListener.get_key_code(assistant_key_string)
         logger.info("Dictation key: %s (code %s)", dictation_key_string, dictation_code)
         logger.info("Assistant key: %s (code %s)", assistant_key_string, assistant_code)
+        if cloud_key_string is not None:
+            logger.info("Cloud key: %s (code %s)", cloud_key_string, cloud_code)
         return EvdevHotkeyListener(
             on_dictation_press=on_dictation_press,
             on_dictation_release=on_dictation_release,
@@ -315,6 +382,9 @@ def create_hotkey_listener(
             on_assistant_release=on_assistant_release,
             dictation_key_code=dictation_code,
             assistant_key_code=assistant_code,
+            on_cloud_press=on_cloud_press,
+            on_cloud_release=on_cloud_release,
+            cloud_key_code=cloud_code,
         )
     else:
         logger.info("X11 detected - using pynput for hotkeys")
@@ -325,4 +395,7 @@ def create_hotkey_listener(
             on_assistant_release=on_assistant_release,
             dictation_key=dictation_key,
             assistant_key=assistant_key,
+            on_cloud_press=on_cloud_press,
+            on_cloud_release=on_cloud_release,
+            cloud_key=cloud_key,
         )

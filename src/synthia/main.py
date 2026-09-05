@@ -110,6 +110,24 @@ class Synthia:
         if dev_mode:
             logger.info("Memory auto-retrieval enabled (dev mode)")
 
+        # Optional second assistant routed to Claude API (cloud) on a separate hotkey
+        self.cloud_assistant: Optional[Assistant] = None
+        self.cloud_enabled = bool(
+            self.config.get("cloud_assistant_enabled", False) and anthropic_key
+        )
+        if self.cloud_enabled:
+            cloud_model = self.config.get("cloud_assistant_model", "claude-haiku-4-5")
+            self.cloud_assistant = Assistant(
+                api_key=anthropic_key,
+                model=cloud_model,
+                memory_size=self.config["conversation_memory"],
+                use_local=False,
+                dev_mode=dev_mode,
+            )
+            logger.info("Cloud assistant initialized (Claude API: %s)", cloud_model)
+        elif self.config.get("cloud_assistant_enabled", False):
+            logger.warning("cloud_assistant_enabled=true but no valid anthropic_api_key found")
+
         # Initialize LLM polisher for dictation accuracy (if enabled)
         use_llm_polish = self.config.get("use_llm_polish", True)
         self.polisher: Optional[TranscriptionPolisher] = None
@@ -152,6 +170,11 @@ class Synthia:
         # Parse hotkeys from config (for X11/pynput)
         self.dictation_key = self._parse_key(self.config["dictation_key"])
         self.assistant_key = self._parse_key(self.config["assistant_key"])
+        cloud_key_string = (
+            self.config.get("cloud_assistant_key") if self.cloud_enabled else None
+        )
+        self.cloud_key = self._parse_key(cloud_key_string) if cloud_key_string else None
+        self.cloud_active = False
 
         # Create hotkey listener (auto-detects Wayland vs X11)
         self.hotkey_listener = create_hotkey_listener(
@@ -163,6 +186,10 @@ class Synthia:
             assistant_key=self.assistant_key,
             dictation_key_string=self.config["dictation_key"],
             assistant_key_string=self.config["assistant_key"],
+            on_cloud_press=self._on_cloud_press if self.cloud_enabled else None,
+            on_cloud_release=self._on_cloud_release if self.cloud_enabled else None,
+            cloud_key=self.cloud_key,
+            cloud_key_string=cloud_key_string,
         )
 
         # Display friendly key names
@@ -176,6 +203,9 @@ class Synthia:
         logger.info("Display server: %s", get_display_server())
         logger.info("Dictation key: %s (hold to dictate)", dictation_display)
         logger.info("Assistant key: %s (hold to ask AI)", assistant_display)
+        if self.cloud_enabled and cloud_key_string:
+            cloud_display = cloud_key_string.replace("Key.", "").replace("_", " ").title()
+            logger.info("Cloud key: %s (hold to ask Claude)", cloud_display)
         logger.info("Synthia ready!")
 
         # Show notification
@@ -383,6 +413,148 @@ class Synthia:
             self.sounds.play_error()
             if self.config.get("show_notifications", True):
                 notify_error(str(e))
+            if self.tray:
+                self.tray.set_status(Status.READY)
+
+    def _on_cloud_press(self) -> None:
+        """Handle cloud assistant key press (Right Shift)."""
+        if not self.running or self.cloud_active or self.assistant_active or self.dictation_active:
+            return
+        if self.cloud_assistant is None:
+            return
+
+        # Reject the press if a previous Claude Code invocation is still
+        # running in the background — they share the same browser/CDP session
+        # and would race for the WhatsApp tab.
+        if getattr(self, "cloud_busy", False):
+            self.sounds.play_error()
+            logger.info("Cloud busy, ignoring Right Shift press")
+            return
+
+        try:
+            self.recorder.start_recording()
+            self.cloud_active = True
+            self._update_state("recording")
+            if self.tray:
+                self.tray.set_status(Status.ASSISTANT)
+            self.sounds.play_start()
+        except Exception as e:
+            logger.error("Could not start recording: %s", e)
+            self.sounds.play_error()
+
+    def _on_cloud_release(self) -> None:
+        """Handle cloud assistant key release (Right Shift).
+
+        Stops the recording and hands off Claude Code invocation + TTS to a
+        background worker thread so the hotkey listener stays responsive (the
+        Claude Code call can take 30s-2min).
+        """
+        if not self.running or not self.cloud_active:
+            return
+
+        try:
+            self.cloud_active = False
+            self._update_state("thinking")
+            self.sounds.play_stop()
+            if self.tray:
+                self.tray.set_status(Status.THINKING)
+
+            audio_data = self.recorder.stop_recording()
+
+            if audio_data:
+                self.cloud_busy = True
+                worker = threading.Thread(
+                    target=self._run_cloud_request,
+                    args=(audio_data,),
+                    daemon=True,
+                )
+                worker.start()
+            else:
+                self._update_state("ready")
+                if self.tray:
+                    self.tray.set_status(Status.READY)
+
+        except Exception as e:
+            logger.error("Cloud assistant error: %s", e)
+            self.sounds.play_error()
+            if self.config.get("show_notifications", True):
+                notify_error(str(e))
+            if self.tray:
+                self.tray.set_status(Status.READY)
+
+    def _run_cloud_request(self, audio_data: bytes) -> None:
+        """Transcribe + invoke Claude Code + speak. Runs in background thread."""
+        import subprocess
+
+        try:
+            text = self.transcriber.transcribe(audio_data)
+            if not text:
+                self._update_state("ready")
+                if self.tray:
+                    self.tray.set_status(Status.READY)
+                return
+
+            logger.info("Cloud command (Claude Code): %s", text)
+
+            # Guide Claude Code: which skill to invoke based on simple
+            # keyword matching, and how to format the answer.
+            skill_hint = ""
+            text_lower = text.lower()
+            if "whatsapp" in text_lower or "whats app" in text_lower:
+                skill_hint = "/whatsapp-via-cdp "
+
+            style = (
+                " Responde breve, conversacional, en español, "
+                "listo para ser leído por TTS. Solo prosa natural, "
+                "sin markdown, listas con guiones, ni JSON."
+            )
+            full_prompt = skill_hint + text + style
+
+            response_text = ""
+            try:
+                result = subprocess.run(
+                    [
+                        "claude",
+                        "--print",
+                        "--model",
+                        "haiku",
+                        "--allowedTools",
+                        "Bash Read",
+                    ],
+                    input=full_prompt,
+                    capture_output=True,
+                    text=True,
+                    timeout=180,
+                )
+                response_text = (result.stdout or "").strip()
+                if result.returncode != 0:
+                    logger.warning(
+                        "claude --print exited %s: %s",
+                        result.returncode,
+                        (result.stderr or "")[:300],
+                    )
+            except FileNotFoundError:
+                response_text = "No encontré claude en el PATH."
+                logger.error("claude CLI not found in PATH")
+            except subprocess.TimeoutExpired:
+                response_text = "Claude tardó demasiado, intenta de nuevo."
+                logger.error("claude --print timed out after 180s")
+
+            if response_text:
+                logger.info("Claude Code response: %s", response_text[:200])
+                self.tts.speak(response_text)
+                self._save_to_history(text, "cloud", response_text)
+                if self.config.get("show_notifications", True):
+                    notify_assistant(response_text)
+
+        except Exception as e:
+            logger.error("Cloud worker error: %s", e)
+            self.sounds.play_error()
+            if self.config.get("show_notifications", True):
+                notify_error(str(e))
+        finally:
+            self.cloud_busy = False
+            self._update_state("ready")
             if self.tray:
                 self.tray.set_status(Status.READY)
 
