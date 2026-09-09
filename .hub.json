@@ -1,0 +1,11 @@
+{
+  "type": "CLI / Herramienta",
+  "level": "prototipo",
+  "notes": "Fork de Synthia (upstream markmiddo, MIT, alpha 0.1.0): asistente de voz y companion de Claude Code para Linux — núcleo Python (Whisper/Piper/Ollama, hotkeys evdev, bot de Telegram, monitor de portapapeles, dashboard TUI Textual) más GUI de escritorio Tauri 2 (Rust + React). Erik lo clonó y lo probó en la máquina vieja; hoy no está instalado ni configurado y sus únicos commits son housekeeping tras la mudanza a CachyOS.",
+  "lang": "Python",
+  "framework": "Tauri 2 + React (GUI) / Textual (TUI)",
+  "priority": "Baja",
+  "testing": "Ad-hoc",
+  "pipeline": "GitHub Actions",
+  "version": "0.1.0"
+}
